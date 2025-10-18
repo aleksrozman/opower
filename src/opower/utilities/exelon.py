@@ -3,9 +3,11 @@
 import json
 import logging
 import re
+from http.cookies import Morsel
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 from ..const import USER_AGENT
 from ..exceptions import CannotConnect, InvalidAuth, MfaChallenge
@@ -94,12 +96,12 @@ class ExelonURLHandler:
                 raise InvalidAuth(f"Failed to authenticate during {error_msg} with error: {result_json['message']}")
         return result_json
 
-    async def get_token(self) -> tuple[str, dict[str, Any]]:
+    async def get_token(self) -> tuple[str, dict[str, Any], dict[str, str]]:
         """Return the the first account and the associated bearer token."""
         # we probably need to select an account as we didn't automatically go to the dashboard
         # so we store these details, always looking up the account
 
-        account = {}
+        account: dict[str, Any] = {}
 
         async with self._session.get(
             f"https://{self._login_domain}/api/Services/MyAccountService.svc/GetSession",
@@ -108,12 +110,19 @@ class ExelonURLHandler:
         ) as resp:
             result_json = await resp.json()
 
-        if not result_json["token"]:
+        if not result_json.get("token"):
             _LOGGER.error("No token provided, authentication flow likely failed")
-            return "", {}
+            return "", {}, {}
 
-        # confirm no account number is set otherwise we can use this account
-        if result_json["accountNumber"] is None:
+        # If all necessary fields are present then we can use the Session data structure,
+        # otherwise we need to retrieve the accounts explicitly.
+        try:
+            state = result_json["PremiseInfo"][0]["mainAddress"]["townDetail"]["stateOrProvince"]
+        except (KeyError, IndexError):
+            state = None
+        if result_json.get("accountNumber") and result_json.get("isResidential") and state:
+            account = result_json
+        else:
             bearer_token = result_json["token"]
 
             # this path comes from GetConfiguration, unsure if its different
@@ -133,21 +142,20 @@ class ExelonURLHandler:
                 # this has the wrong mime type for some reason
                 result = await resp.json(content_type="text/html")
 
-            if result["success"] is not True:
+            if result.get("success") is not True:
                 raise InvalidAuth("Unable to list accounts")
 
             # Only include active accounts (after moving, old accounts have status: "Inactive")
             # NOTE: this logic currently assumes 1 active address per account, if multiple accounts found
             #      we default to taking the first in the list. Future enhancement is to support
             #      multiple accounts (which could result in different subdomain for each)
-            active_accounts = [account for account in result["data"] if account["status"] == "Active"]
+            active_accounts = [account for account in result.get("data", []) if account.get("status") == "Active"]
 
             if len(active_accounts) == 0:
                 raise InvalidAuth("No active accounts found")
 
-            account = active_accounts[0]
-
             # set the first active one
+            account = active_accounts[0]
             account_number = account["accountNumber"]
 
             async with self._session.post(
@@ -159,8 +167,6 @@ class ExelonURLHandler:
                 raise_for_status=True,
             ) as resp:
                 result = await resp.text(encoding="utf-8")
-        else:
-            account = result_json
 
         async with self._session.post(
             f"https://{self._login_domain}/api/Services/OpowerService.svc/GetOpowerToken",
@@ -170,7 +176,20 @@ class ExelonURLHandler:
         ) as resp:
             result_json = await resp.json()
 
-        return str(result_json["access_token"]), account
+        relevant_cookies = {}
+        if cookies := self._session.cookie_jar.filter_cookies(URL("https://" + self._login_domain)):
+            asp_session = cookies.get("ASP.NET_SessionId", Morsel())
+            asp_c1 = cookies.get(".AspNet.cookieC1", Morsel())
+            asp_c2 = cookies.get(".AspNet.cookieC2", Morsel())
+            if asp_session and asp_c1 and asp_c2:
+                relevant_cookies = {
+                    "ASP.NET_SessionId": asp_session.value,
+                    ".AspNet.cookie": "chunks:2",
+                    ".AspNet.cookieC1": asp_c1.value,
+                    ".AspNet.cookieC2": asp_c2.value,
+                }
+
+        return str(result_json["access_token"]), account, relevant_cookies
 
 
 class ExelonMfaHandler(MfaHandlerBase):
@@ -295,11 +314,11 @@ class ExelonMfaHandler(MfaHandlerBase):
             )
 
         _ = await self._exelon_handler.get(f"api/{self._exelon_handler.get_api()}/confirmed")
-        token, account = await self._exelon_handler.get_token()
+        token, account, cookies = await self._exelon_handler.get_token()
 
         if token and account:
             _LOGGER.debug("MFA code accepted, received login data")
-            return {"token": token, "account": account}
+            return {"token": token, "account": account, "cookies": cookies}
 
         raise InvalidAuth("Authentication flow failed")
 
@@ -350,12 +369,15 @@ class Exelon:
         """Login to the utility website and authorize opower."""
         account = login_data.get("account", {})
         token: str = str(login_data.get("token", ""))
+        cookies = login_data.get("cookies", {})
         # Initial URL is the login_domain, but it will change if we are redirected
         exelon_handler = ExelonURLHandler(session, {}, cls.login_domain(), cls.login_domain())
 
-        if not token or not account:
-            result, path, login_post_domain = await exelon_handler.get("Pages/Login.aspx?/login")
+        if cookies:
+            session.cookie_jar.update_cookies(cookies, URL("https://" + cls.login_domain()))
 
+        result, path, login_post_domain = await exelon_handler.get("Pages/Login.aspx?/login")
+        if not token or not account:
             # if we don't go to /accounts/dashboard, we need to perform some authorization steps
             if path.endswith("/authorize"):
                 # transId = "StateProperties=..."
@@ -394,10 +416,12 @@ class Exelon:
                     }
                     raise MfaChallenge("Exelon MFA required", ExelonMfaHandler(session, password, challenge))
 
-                if path.endswith("/accounts/login/select-account") or path.endswith("Pages/ChangeAccount.aspx"):
-                    token, account = await exelon_handler.get_token()
             else:
                 raise InvalidAuth("Site is down or has changed behavior")
+
+        token, account, _ = await exelon_handler.get_token()
+        if not token:
+            raise InvalidAuth("Reauthentication is needed")
 
         # If pepco or delmarva, determine if we should use secondary subdomain
         if cls.login_domain() in ["secure.pepco.com", "secure.delmarva.com"]:
